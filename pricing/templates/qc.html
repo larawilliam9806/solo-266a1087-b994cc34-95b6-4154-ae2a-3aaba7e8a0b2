@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}质量核验 · 任务 {{ job.id }} · 旧报纸价目表录入{% endblock %}
+{% block topbar %}
+  <span class="crumb">{{ job.filename }}</span>
+  <span class="topbar-actions">
+    <a class="button" href="{{ url_for('job_view', job_id=job.id) }}">返回归位页</a>
+    {% if report and not stale %}
+    <a class="button primary" id="qc-download-link"
+       href="{{ url_for('qc_csv', job_id=job.id) }}">下载质检 CSV</a>
+    {% else %}
+    <a class="button disabled" id="qc-download-link" aria-disabled="true"
+       title="{{ '核验结果已失效，请重新核验' if stale else '运行核验后才可下载' }}">下载质检 CSV</a>
+    {% endif %}
+  </span>
+{% endblock %}
+
+{% block content %}
+<section class="card" id="qc-status-card">
+  <div class="panel-head">
+    <h2>质量核验</h2>
+    <form method="post" action="{{ url_for('qc_run', job_id=job.id) }}">
+      <button class="primary" type="submit" id="qc-run" {% if not can_run %}disabled{% endif %}>
+        {{ '重新核验' if report else '运行核验' }}
+      </button>
+    </form>
+  </div>
+  <p class="muted">
+    对已全部归位、没有待核框的三列结果逐行检查：品名、规格是否为空，批发价是否为正十进制，
+    以及同键（品名＋规格）是否出现不同价格。核验结果保存在服务端；
+    此后格线或人工归位一旦变化，本次核验即失效，需重新核验，页面与下载始终来自同一份已保存状态。
+  </p>
+  {% if not can_run %}
+  <p class="notice warn" id="qc-blocked">
+    {% if not state.grid_valid %}{{ state.invalid }}，无法核验。
+    {% else %}还有 {{ state.pending }} 个文字框待核对，全部归位后才能核验。{% endif %}
+    <a href="{{ url_for('job_view', job_id=job.id) }}">回到归位页处理</a>
+  </p>
+  {% endif %}
+  {% if report %}
+  <div class="qc-meta">
+    <span class="muted">核验时间：{{ report.created_at }}</span>
+    {% if stale %}
+    <span class="pill bad" id="qc-task-status">已失效</span>
+    {% else %}
+    <span class="pill {{ 'good' if report.summary.status == 'pass' else 'bad' }}" id="qc-task-status">
+      {{ report.summary.status_label }}
+    </span>
+    {% endif %}
+  </div>
+  {% if stale %}
+  <p class="notice bad" id="qc-stale-notice">
+    自本次核验以来，格线或人工归位已发生变化，以下核验结果已失效，仅供对照；请重新核验后再下载质检 CSV。
+  </p>
+  {% endif %}
+  {% else %}
+  <p class="muted" id="qc-empty">尚未核验。全部文字框归位后，点击“运行核验”生成质检结果。</p>
+  {% endif %}
+</section>
+
+{% if report %}
+<section class="card{% if stale %} stale{% endif %}" id="qc-summary-card">
+  <div class="panel-head">
+    <h2>核验结果</h2>
+    <span class="muted">
+      共 {{ report.summary.rows }} 行 · 正常 {{ report.summary.ok }} 行 · 异常 {{ report.summary.anomaly }} 行
+    </span>
+  </div>
+  <div class="filterbar" id="qc-filters">
+    {% for item in filters %}
+    <a class="filter{% if item.active %} active{% endif %}"
+       href="{{ url_for('qc_view', job_id=job.id, filter=item.key) }}"
+       data-filter="{{ item.key }}">{{ item.label }}（{{ item.count }}）</a>
+    {% endfor %}
+  </div>
+  <table class="qc-table{% if not rows %} empty{% endif %}" id="qc-table">
+    <thead>
+      <tr>
+        <th>行</th><th>品名</th><th>规格</th><th>批发价</th>
+        <th>状态</th><th>异常原因</th><th>来源框号</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+      <tr class="{{ 'ok' if row.ok else 'anomaly' }}">
+        <td class="muted">{{ row.row }}</td>
+        <td>{% if row.name %}{{ row.name }}{% else %}<span class="muted">（空）</span>{% endif %}</td>
+        <td>{% if row.spec %}{{ row.spec }}{% else %}<span class="muted">（空）</span>{% endif %}</td>
+        <td>{% if row.price %}{{ row.price }}{% else %}<span class="muted">（空）</span>{% endif %}</td>
+        <td><span class="pill {{ 'good' if row.ok else 'bad' }}">{{ row.status_label }}</span></td>
+        <td class="reasons">
+          {% for reason in row.reasons %}
+          <span class="reason">{{ reason }}</span>{% if not loop.last %}<br>{% endif %}
+          {% else %}<span class="muted">—</span>{% endfor %}
+        </td>
+        <td class="refs muted">{{ row.refs_text }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="muted" id="qc-filter-empty" {% if rows %}hidden{% endif %}>该筛选条件下没有行。</p>
+</section>
+{% endif %}
+{% endblock %}

@@ -392,11 +392,12 @@ def reading_order(items):
     return ordered
 
 
-def build_rows(evaluated):
-    """Compile placed boxes into the three-column output rows.
+def build_rows_detailed(evaluated):
+    """Compile placed boxes into three-column rows with source box refs.
 
-    Returns a list of {row, name, spec, price} in grid-row order.  Blank
-    columns stay empty; rows without any text are dropped.
+    Returns a list of {row, name, spec, price, refs} in grid-row order, where
+    refs maps each column to the 框号 list that produced its text (in reading
+    order).  Blank columns stay empty; rows without any text are dropped.
     """
     placed = [item for item in evaluated
               if item["status"] in ("assigned_auto", "assigned_manual")]
@@ -410,15 +411,31 @@ def build_rows(evaluated):
         columns = {"name": [], "spec": [], "price": []}
         for item in cells:
             columns[item["column"]].append(item)
-        row = {"row": row_index + 1}
+        row = {"row": row_index + 1, "refs": {}}
         has_text = False
         for column in COLUMNS:
-            text = "".join(entry["text"] for entry in reading_order(columns[column]))
+            ordered = reading_order(columns[column])
+            text = "".join(entry["text"] for entry in ordered)
             row[column] = text
+            row["refs"][column] = [
+                entry["box_ref"] or str(entry["box_id"]) for entry in ordered
+            ]
             has_text = has_text or bool(text)
         if has_text:
             output.append(row)
     return output
+
+
+def build_rows(evaluated):
+    """Compile placed boxes into the three-column output rows.
+
+    Returns a list of {row, name, spec, price} in grid-row order.  Blank
+    columns stay empty; rows without any text are dropped.
+    """
+    return [
+        {key: row[key] for key in ("row", "name", "spec", "price")}
+        for row in build_rows_detailed(evaluated)
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -244,6 +244,38 @@ class ReadingOrderTests(unittest.TestCase):
         self.assertEqual(rows[0]["price"], "1.2")
 
 
+class DetailedRowsTests(unittest.TestCase):
+    def test_refs_follow_reading_order_per_column(self):
+        grid = layout.Grid(H, V)
+        boxes = [
+            make_box(1, "1", "白砂糖", 10, 10, 90, 40),
+            make_box(2, "2", "一级", 110, 10, 190, 40),
+            make_box(3, "3", "5.00", 210, 10, 290, 40),
+            make_box(4, "4", "红糖", 10, 110, 90, 140),
+        ]
+        rows = layout.build_rows_detailed(layout.evaluate(grid, boxes, {}))
+        self.assertEqual(rows[0]["refs"],
+                         {"name": ["1"], "spec": ["2"], "price": ["3"]})
+        self.assertEqual(rows[1]["refs"],
+                         {"name": ["4"], "spec": [], "price": []})
+
+    def test_refs_concatenate_multi_box_cells_in_reading_order(self):
+        grid = layout.Grid([0, 100], V)
+        boxes = [
+            make_box(1, "1", "下", 10, 60, 90, 90),
+            make_box(2, "2", "上", 10, 10, 90, 40),
+        ]
+        rows = layout.build_rows_detailed(layout.evaluate(grid, boxes, {}))
+        self.assertEqual(rows[0]["name"], "上下")
+        self.assertEqual(rows[0]["refs"]["name"], ["2", "1"])
+
+    def test_build_rows_strips_refs(self):
+        grid = layout.Grid(H, V)
+        boxes = [make_box(1, "1", "盐", 10, 10, 90, 40)]
+        rows = layout.build_rows(layout.evaluate(grid, boxes, {}))
+        self.assertEqual(sorted(rows[0].keys()), ["name", "price", "row", "spec"])
+
+
 class LayoutNormalisationTests(unittest.TestCase):
     def test_requires_four_vertical_lines(self):
         with self.assertRaises(layout.LayoutError):

@@ -43,3 +43,16 @@ CREATE TABLE IF NOT EXISTS decisions (
     created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     PRIMARY KEY (job_id, box_id)
 );
+
+-- Saved quality-verification report, one per job (re-running replaces it).
+-- `fingerprint` hashes the boxes + ruling lines + human decisions the report
+-- was computed from; any later line or decision change no longer matches and
+-- the report is treated as invalidated.  `summary` and `rows` are JSON and
+-- are the single saved state behind both the QC page and the QC CSV download.
+CREATE TABLE IF NOT EXISTS qc_reports (
+    job_id      INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    fingerprint TEXT    NOT NULL,
+    summary     TEXT    NOT NULL DEFAULT '{}',
+    rows        TEXT    NOT NULL DEFAULT '[]',
+    created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);

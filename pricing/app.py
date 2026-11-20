@@ -8,8 +8,11 @@ inside a single cell, then download the three-column CSV.
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
+import json
 import os
+import re
 from pathlib import Path
 from urllib.parse import quote
 
@@ -28,6 +31,7 @@ from flask import (
 
 from . import db
 from . import layout
+from . import qc
 from .csvparse import CsvError, parse_csv
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
@@ -278,6 +282,150 @@ def create_app(config=None):
             headers={
                 "Content-Disposition":
                     f"attachment; filename*=UTF-8''{_quote_filename(name + '-价目表.csv')}"
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Quality verification
+    # ------------------------------------------------------------------
+    def state_fingerprint(boxes, horizontal, vertical, decisions):
+        """Hash of everything the three-column result depends on.
+
+        Any ruling-line or human-decision change produces a different
+        fingerprint, which invalidates the saved QC report; restoring the
+        exact earlier state makes the saved report valid again.
+        """
+        payload = {
+            "horizontal": horizontal,
+            "vertical": vertical,
+            "boxes": [
+                [box["id"], box["box_ref"], box["text"],
+                 box["x1"], box["y1"], box["x2"], box["y2"]]
+                for box in boxes
+            ],
+            "decisions": [
+                [box_id, decision["kind"], decision["target_cell"],
+                 decision["overlap_cells"]]
+                for box_id, decision in sorted(decisions.items())
+            ],
+        }
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":"))
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def qc_context(job_id):
+        """Current fingerprint plus the saved report and its validity."""
+        connection = get_db()
+        job = load_job_or_404(job_id)
+        boxes = db.get_boxes(connection, job_id)
+        horizontal, vertical = db.get_lines(connection, job_id)
+        decisions = db.get_decisions(connection, job_id)
+        fingerprint = state_fingerprint(boxes, horizontal, vertical, decisions)
+        report = db.get_qc_report(connection, job_id)
+        stale = report is not None and report["fingerprint"] != fingerprint
+        return job, report, stale
+
+    QC_FILTERS = (
+        ("all", "全部"),
+        ("anomaly", "仅异常"),
+        ("ok", "仅正常"),
+        *[(key, qc.ISSUE_LABELS[key]) for key in qc.ISSUE_ORDER],
+    )
+
+    def filter_view_rows(rows, filter_key):
+        if filter_key == "all":
+            return rows
+        if filter_key == "anomaly":
+            return [row for row in rows if row["issues"]]
+        if filter_key == "ok":
+            return [row for row in rows if not row["issues"]]
+        return [row for row in rows if filter_key in row["issues"]]
+
+    @app.get("/jobs/<int:job_id>/qc")
+    def qc_view(job_id):
+        state = job_state(job_id)
+        job, report, stale = qc_context(job_id)
+        filter_key = request.args.get("filter", "all")
+        if filter_key not in dict(QC_FILTERS):
+            filter_key = "all"
+
+        rows = []
+        filters = []
+        if report is not None:
+            rows = qc.view_rows(report["rows"])
+            summary = report["summary"]
+            counts = {
+                "all": summary.get("rows", len(rows)),
+                "anomaly": summary.get("anomaly", 0),
+                "ok": summary.get("ok", 0),
+            }
+            counts.update(summary.get("by_type") or {})
+            filters = [
+                {"key": key, "label": label, "count": counts.get(key, 0),
+                 "active": key == filter_key}
+                for key, label in QC_FILTERS
+            ]
+        visible = filter_view_rows(rows, filter_key)
+        return render_template(
+            "qc.html", job=job, state=state, report=report, stale=stale,
+            rows=visible, filters=filters, filter_key=filter_key,
+            can_run=state["grid_valid"] and state["pending"] == 0,
+        )
+
+    @app.post("/jobs/<int:job_id>/qc/run")
+    def qc_run(job_id):
+        state = job_state(job_id)
+        if not state["grid_valid"]:
+            flash(state["invalid"] + "，无法核验", "error")
+            return redirect(url_for("qc_view", job_id=job_id))
+        if state["pending"] > 0:
+            flash(f"还有 {state['pending']} 个文字框待核对，全部归位后才能核验", "error")
+            return redirect(url_for("qc_view", job_id=job_id))
+
+        connection = get_db()
+        boxes = db.get_boxes(connection, job_id)
+        decisions = db.get_decisions(connection, job_id)
+        detailed = layout.build_rows_detailed(state["boxes"])
+        report_rows, summary = qc.check_rows(detailed)
+        fingerprint = state_fingerprint(
+            boxes, state["horizontal"], state["vertical"], decisions)
+        db.save_qc_report(connection, job_id, fingerprint, summary, report_rows)
+        flash(
+            f"核验完成：{summary['status_label']}（{summary['rows']} 行，"
+            f"异常 {summary['anomaly']} 行）",
+            "success" if summary["status"] == "pass" else "warning",
+        )
+        return redirect(url_for("qc_view", job_id=job_id))
+
+    @app.get("/jobs/<int:job_id>/qc.csv")
+    def qc_csv(job_id):
+        _job, report, stale = qc_context(job_id)
+        if report is None:
+            abort(409, description="尚未核验，请先在质量核验页运行核验")
+        if stale:
+            abort(409, description="格线或人工归位已变化，核验结果已失效，请重新核验后再下载")
+        summary = report["summary"]
+        task_status = summary.get("status_label", "")
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\r\n")
+        writer.writerow(["行号", "品名", "规格", "批发价", "行状态",
+                         "异常原因", "来源框号", "任务状态"])
+        for row in qc.view_rows(report["rows"]):
+            writer.writerow([
+                row["row"], row["name"], row["spec"], row["price"],
+                row["status_label"], row["reasons_text"], row["refs_text"],
+                task_status,
+            ])
+        data = "﻿" + buffer.getvalue()
+        name = Path(_job["filename"]).stem or "pricelist"
+        stamp = re.sub(r"\D", "", report.get("created_at", ""))[:14]
+        filename = f"{name}-质检-{stamp}.csv" if stamp else f"{name}-质检.csv"
+        return Response(
+            data,
+            mimetype="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition":
+                    f"attachment; filename*=UTF-8''{_quote_filename(filename)}"
             },
         )
 

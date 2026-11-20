@@ -146,3 +146,37 @@ def clear_decision(connection, job_id, box_id):
         "DELETE FROM decisions WHERE job_id = ? AND box_id = ?", (job_id, box_id)
     )
     connection.commit()
+
+
+def save_qc_report(connection, job_id, fingerprint, summary, rows):
+    """Store the verification report for a job, replacing any previous one."""
+    connection.execute(
+        "INSERT INTO qc_reports (job_id, fingerprint, summary, rows)"
+        " VALUES (?, ?, ?, ?)"
+        " ON CONFLICT (job_id) DO UPDATE SET"
+        " fingerprint = excluded.fingerprint, summary = excluded.summary,"
+        " rows = excluded.rows,"
+        " created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+        (job_id, fingerprint,
+         json.dumps(summary, ensure_ascii=False),
+         json.dumps(rows, ensure_ascii=False)),
+    )
+    connection.commit()
+
+
+def get_qc_report(connection, job_id):
+    row = connection.execute(
+        "SELECT * FROM qc_reports WHERE job_id = ?", (job_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    record = dict(row)
+    try:
+        record["summary"] = json.loads(record["summary"] or "{}")
+    except ValueError:
+        record["summary"] = {}
+    try:
+        record["rows"] = json.loads(record["rows"] or "[]")
+    except ValueError:
+        record["rows"] = []
+    return record

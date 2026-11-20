@@ -269,5 +269,201 @@ class JobManagementTests(AppTestCase):
         self.assertGreaterEqual(len(data["horizontal"]), 2)
 
 
+QC_SAMPLE = """框号,文字,x1,y1,x2,y2
+1,白砂糖,10,10,90,40
+2,一级,110,10,190,40
+3,5.00,210,10,290,40
+4,红糖,10,110,90,140
+5,1.20,210,110,290,140
+6,食盐,10,210,90,240
+7,散装,110,210,190,240
+8,abc,210,210,290,240
+9,白砂糖,10,310,90,340
+10,一级,110,310,190,340
+11,4.80,210,310,290,340
+12,特级,110,410,190,440
+13,9.99,210,410,290,440
+14,注,95,10,105,40
+"""
+
+QC_H = [0, 100, 200, 300, 400, 500]
+QC_V = [0, 100, 200, 300]
+
+
+class QCTests(AppTestCase):
+    """Quality-verification page, invalidation and CSV download."""
+
+    def setUp(self):
+        super().setUp()
+        response = self.upload(body=QC_SAMPLE, filename="qc.csv")
+        self.assertEqual(response.status_code, 302)
+        self.job = int(response.headers["Location"].rstrip("/").split("/")[-1])
+        self.assertEqual(self.set_lines(self.job, QC_H, QC_V).status_code, 200)
+
+    def resolve_straddler(self):
+        """Exclude box 14 (straddles a column line) so nothing is pending."""
+        state = self.state(self.job)
+        box14 = self.box_id(state, "14")
+        response = self.client.post(
+            f"/api/jobs/{self.job}/decisions",
+            json={"box_id": box14, "kind": "exclude"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.state(self.job)["pending"], 0)
+        return box14
+
+    def run_qc(self):
+        return self.client.post(f"/jobs/{self.job}/qc/run", follow_redirects=True)
+
+    def test_job_page_links_to_qc_page(self):
+        response = self.client.get(f"/jobs/{self.job}")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("质量核验".encode("utf-8"), response.data)
+        self.assertIn(f"/jobs/{self.job}/qc".encode("utf-8"), response.data)
+
+    def test_qc_page_prompts_to_run_before_first_verification(self):
+        response = self.client.get(f"/jobs/{self.job}/qc")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("尚未核验".encode("utf-8"), response.data)
+
+    def test_qc_run_blocked_while_boxes_pending(self):
+        response = self.run_qc()
+        self.assertIn("全部归位后才能核验".encode("utf-8"), response.data)
+        self.assertIn("尚未核验".encode("utf-8"), response.data)
+        self.assertEqual(self.client.get(f"/jobs/{self.job}/qc.csv").status_code, 409)
+
+    def test_qc_report_lists_every_anomaly_with_reasons_and_refs(self):
+        self.resolve_straddler()
+        response = self.run_qc()
+        self.assertIn("核验未通过".encode("utf-8"), response.data)
+        page = response.data.decode("utf-8")
+        # Per-row anomaly reasons.
+        self.assertIn("规格为空", page)                      # row 2
+        self.assertIn("批发价“abc”不是正十进制", page)        # row 3
+        self.assertIn("品名为空", page)                      # row 5
+        self.assertIn("同键不同价", page)                    # rows 1 & 4
+        self.assertIn("5.00（第 1 行）", page)
+        self.assertIn("4.80（第 4 行）", page)
+        # Source box numbers per row.
+        self.assertIn("品名:1；规格:2；批发价:3", page)
+        self.assertIn("品名:（无）；规格:12；批发价:13", page)
+        # Filter bar counts.
+        self.assertIn("同键不同价（2）", page)
+        self.assertIn("品名为空（1）", page)
+        self.assertIn("批发价非正十进制（1）", page)
+
+    def test_qc_filter_selects_rows_by_issue_type(self):
+        self.resolve_straddler()
+        self.run_qc()
+        page = self.client.get(f"/jobs/{self.job}/qc?filter=bad_price").data.decode("utf-8")
+        self.assertIn("食盐", page)
+        self.assertNotIn("红糖", page)
+        self.assertNotIn("白砂糖", page)
+
+        page = self.client.get(f"/jobs/{self.job}/qc?filter=missing_name").data.decode("utf-8")
+        self.assertIn("特级", page)
+        self.assertNotIn("食盐", page)
+
+        page = self.client.get(f"/jobs/{self.job}/qc?filter=ok").data.decode("utf-8")
+        self.assertIn("该筛选条件下没有行", page)
+
+        page = self.client.get(f"/jobs/{self.job}/qc?filter=bogus").data.decode("utf-8")
+        self.assertIn("白砂糖", page)  # unknown filter falls back to 全部
+
+    def test_qc_csv_carries_row_and_task_status(self):
+        self.resolve_straddler()
+        self.run_qc()
+        response = self.client.get(f"/jobs/{self.job}/qc.csv")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data.startswith(b"\xef\xbb\xbf"))
+        text = response.data.decode("utf-8-sig")
+        lines = [line for line in text.splitlines() if line.strip()]
+        self.assertEqual(
+            lines[0], "行号,品名,规格,批发价,行状态,异常原因,来源框号,任务状态")
+        self.assertEqual(len(lines), 6)  # header + 5 rows
+        joined = "\n".join(lines)
+        self.assertIn("红糖,,1.20,异常,规格为空", joined)
+        self.assertIn("食盐,散装,abc,异常,批发价“abc”不是正十进制", joined)
+        self.assertIn("白砂糖,一级,5.00,异常,同键不同价", joined)
+        self.assertIn(",特级,9.99,异常,品名为空", joined)
+        self.assertIn("品名:1；规格:2；批发价:3,核验未通过", joined)
+        # Every data row carries the task status marker.
+        for line in lines[1:]:
+            self.assertTrue(line.endswith(",核验未通过"), line)
+
+    def test_qc_csv_filename_marks_verification_time(self):
+        self.resolve_straddler()
+        self.run_qc()
+        response = self.client.get(f"/jobs/{self.job}/qc.csv")
+        disposition = response.headers["Content-Disposition"]
+        self.assertIn("filename*=UTF-8''", disposition)
+        self.assertIn("%E8%B4%A8%E6%A3%80", disposition)  # 质检
+
+    def test_qc_csv_blocked_without_report(self):
+        self.resolve_straddler()
+        response = self.client.get(f"/jobs/{self.job}/qc.csv")
+        self.assertEqual(response.status_code, 409)
+
+    def test_line_change_invalidates_saved_report(self):
+        self.resolve_straddler()
+        self.run_qc()
+        self.assertEqual(self.client.get(f"/jobs/{self.job}/qc.csv").status_code, 200)
+
+        moved = [0, 100, 200, 300, 400, 520]
+        self.assertEqual(self.set_lines(self.job, moved, QC_V).status_code, 200)
+        page = self.client.get(f"/jobs/{self.job}/qc").data.decode("utf-8")
+        self.assertIn("已失效", page)
+        self.assertIn("白砂糖", page)  # old saved report still shown, dimmed
+        response = self.client.get(f"/jobs/{self.job}/qc.csv")
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("已失效".encode("utf-8"), response.data)
+
+        # Restoring the exact earlier state makes the saved report valid again.
+        self.assertEqual(self.set_lines(self.job, QC_H, QC_V).status_code, 200)
+        self.assertEqual(self.client.get(f"/jobs/{self.job}/qc.csv").status_code, 200)
+
+    def test_decision_change_invalidates_saved_report(self):
+        box14 = self.resolve_straddler()
+        self.run_qc()
+        self.assertEqual(self.client.get(f"/jobs/{self.job}/qc.csv").status_code, 200)
+
+        response = self.client.delete(f"/api/jobs/{self.job}/decisions/{box14}")
+        self.assertEqual(response.status_code, 200)
+        page = self.client.get(f"/jobs/{self.job}/qc").data.decode("utf-8")
+        self.assertIn("已失效", page)
+        self.assertEqual(self.client.get(f"/jobs/{self.job}/qc.csv").status_code, 409)
+
+        # Re-excluding restores the identical state: report valid again.
+        self.client.post(f"/api/jobs/{self.job}/decisions",
+                         json={"box_id": box14, "kind": "exclude"})
+        self.assertEqual(self.client.get(f"/jobs/{self.job}/qc.csv").status_code, 200)
+
+    def test_rerun_replaces_report_and_clears_invalidation(self):
+        self.resolve_straddler()
+        self.run_qc()
+        moved = [0, 100, 200, 300, 400, 520]
+        self.set_lines(self.job, moved, QC_V)
+        self.assertEqual(self.client.get(f"/jobs/{self.job}/qc.csv").status_code, 409)
+        self.run_qc()
+        page = self.client.get(f"/jobs/{self.job}/qc").data.decode("utf-8")
+        self.assertNotIn("已失效", page)
+        self.assertEqual(self.client.get(f"/jobs/{self.job}/qc.csv").status_code, 200)
+
+    def test_clean_page_passes(self):
+        response = self.upload(body=(
+            "框号,文字,x1,y1,x2,y2\n"
+            "1,白砂糖,10,10,90,40\n"
+            "2,一级,110,10,190,40\n"
+            "3,5.00,210,10,290,40\n"
+        ), filename="clean.csv")
+        job = int(response.headers["Location"].rstrip("/").split("/")[-1])
+        self.set_lines(job, [0, 100], [0, 100, 200, 300])
+        page = self.client.post(f"/jobs/{job}/qc/run",
+                                follow_redirects=True).data.decode("utf-8")
+        self.assertIn("核验通过", page)
+        text = self.client.get(f"/jobs/{job}/qc.csv").data.decode("utf-8-sig")
+        self.assertIn("白砂糖,一级,5.00,正常,,品名:1；规格:2；批发价:3,核验通过", text)
+
+
 if __name__ == "__main__":
     unittest.main()
